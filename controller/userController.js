@@ -1,0 +1,365 @@
+const { catchAsyncError } = require('../middleware/asyncError');
+const { ErrorHandler } = require('../middleware/error');
+const { User } = require('../model/userSchema');
+const { emailTemplate } = require('../utilis/emailTemplete');
+const { genereateJwtTokenForBrowser } = require('../utilis/jwtToken');
+const { sendVerificationEmail } = require('../utilis/nodeMailer');
+const cloudinary = require('cloudinary').v2;
+const twilio = require('twilio'); // Or, for ESM: import twilio from "twilio";
+const bcrypt = require('bcrypt');
+const crypto = require('crypto');
+// Find your Account SID and Auth Token at twilio.com/console
+// and set the environment variables. See http://twil.io/secure
+const accountSid = process.env.TWILIO_ACCOUNT_SID;
+const authToken = process.env.TWILIO_AUTH_TOKEN;
+const client = twilio(accountSid, authToken);
+
+// OTP Verification using email or phone number
+const userChoosenVerificationMethod = async (
+  user,
+  email,
+  phoneNumber,
+  verificationCode,
+  accountVerificationMethod,
+  res,
+  next
+) => {
+  try {
+    if (accountVerificationMethod == 'email') {
+      const template = emailTemplate(verificationCode);
+      sendVerificationEmail(email, 'Verification email sent!', template);
+      res.status(200).json({
+        success: true,
+        message: `Email sent at ${email}`,
+        email,
+        phoneNumber,
+        user,
+      });
+    } else if (accountVerificationMethod === 'phoneNumber') {
+      const verificationCodeWithSpace = verificationCode
+        .toString()
+        .split('')
+        .join(' ');
+      const response = client.calls.create({
+        // from: process.env.USER_EMAIL,
+        to: +8801824750778,
+        from: +8801824750778,
+        twiml: `<Response> <Say> Your OTP is ${verificationCodeWithSpace}, Your OTP is ${verificationCodeWithSpace} </Say> </Response>`,
+      });
+      if (!response) {
+        return next(new ErrorHandler('Error from twilio', 401));
+      }
+      res.status(200).json({
+        success: true,
+        message: 'We will send your OTP through a phone call.',
+        user,
+      });
+    } else {
+      return next(new ErrorHandler('Invalid verification method', 404));
+    }
+  } catch (error) {
+    return next(new ErrorHandler('Error from verification method', 500));
+  }
+};
+
+// User registration
+const register = catchAsyncError(async (req, res, next) => {
+  //user input
+  const {
+    profile,
+    fullName,
+    email,
+    phoneNumber,
+    password,
+    accountVerificationMethod,
+  } = req.body;
+  // validation
+  if (!req.files || Object.keys(req.files).length === 0) {
+    return next(new ErrorHandler('No file were uploaded!'));
+  }
+  const { image } = req.files;
+
+  //upload your image into cloudinary
+  const cloudinaryResponseForProfileImg = await cloudinary.uploader.upload(
+    image.tempFilePath,
+    {
+      folder: 'AUTH_V2',
+    }
+  );
+  if (
+    !cloudinaryResponseForProfileImg ||
+    cloudinaryResponseForProfileImg.error
+  ) {
+    console.error(
+      'cloudinary error',
+      cloudinaryResponseForProfileImg.error || 'Unknown cloudniray error'
+    );
+    return next(new ErrorHandler('Image not fuond', 404));
+  }
+  // validation
+  if (
+    !fullName ||
+    !email ||
+    !phoneNumber ||
+    !password ||
+    !accountVerificationMethod
+  ) {
+    return next(new ErrorHandler('Credentials Missing!', 401));
+  }
+  const phoneNumberValidate = phoneNumber => {
+    // only Bangladesh's phone number can verifi their otp through phone number
+    const phoneRegx = /^\+880\d{10}$/;
+    return phoneRegx.test(phoneNumber);
+  };
+  if (!phoneNumberValidate(phoneNumber)) {
+    return next(new ErrorHandler('Phone Number format Invalid!', 401));
+  }
+  //find user into database and see is user already register or exist into database
+  const isUserAlreadyExist = await User.findOne({
+    $or: [
+      { email: email, accountVerified: true },
+      { phoneNumber: phoneNumber, accountVerified: true },
+    ],
+  });
+  if (isUserAlreadyExist) {
+    return next(new ErrorHandler('This Email or Number Already Exist!', 400));
+  }
+
+  // if a user tried to register multiple time but failed
+  const userTotalAttemptToRegister = await User.find({
+    $or: [
+      { email: email, accountVerified: false },
+      { phoneNumber: phoneNumber, accountVerified: false },
+    ],
+  });
+
+  if (userTotalAttemptToRegister.length > 3) {
+    return next(
+      new ErrorHandler(
+        "You've just exceded your attempt limit! \nplz try half an hour later",
+        401
+      )
+    );
+  }
+
+  // Upload Profile profile
+  const user = await User.create({
+    profile: {
+      public_id: cloudinaryResponseForProfileImg.public_id,
+      secure_url: cloudinaryResponseForProfileImg.secure_url,
+    },
+    fullName,
+    email,
+    phoneNumber,
+    password,
+    accountVerificationMethod,
+  });
+  // console.log(cloudinaryResponseForProfileImg);
+  if (!user) {
+    return next(new ErrorHandler("User info couldn't save!", 400));
+  }
+  const verificationCode = await user.generateVerificationCode();
+  await userChoosenVerificationMethod(
+    user,
+    email,
+    phoneNumber,
+    verificationCode,
+    accountVerificationMethod,
+    res,
+    next
+  );
+  user.verificationCode = verificationCode;
+  user.verificationCodeExpire = Date.now() * 5 * 60 * 1000;
+  user.save();
+
+  console.log('user info saved successfully!');
+});
+
+const verifyOtp = catchAsyncError(async (req, res, next) => {
+  try {
+    const { email, phoneNumber, otp } = req.body;
+
+    //Find all unverified users with the same email or phoneNumber.
+    //Keep the most recently created one, using sort()
+    //Delete the others. using deleteMany()
+    const findUnverifiedUser = await User.find({
+      $or: [
+        { email: email, accountVerified: false },
+        { phoneNumber: phoneNumber, accountVerified: false },
+      ],
+    }).sort({ createdAt: -1 });
+
+    if (!findUnverifiedUser) {
+      return next(new ErrorHandler('User not found!', 404));
+    }
+
+    let user;
+
+    if (findUnverifiedUser.length > 1) {
+      user = findUnverifiedUser[0];
+      // $ne = Not Equal
+      //Returns all unverified users except the one with (user._id)
+      const deleteUnverifieduser = await User.deleteMany({
+        _id: { $ne: user._id },
+        $or: [
+          { email: email, accountVerified: false },
+          { phoneNumber: phoneNumber, accountVerified: false },
+        ],
+      });
+    } else {
+      user = findUnverifiedUser[0];
+    }
+
+    if (user.verificationCode !== otp) {
+      return next(new ErrorHandler("OTP didn't match!", 401));
+    }
+
+    const currentTime = Date.now();
+    const otpExpireTime = new Date(user.verificationCodeExpire).getTime();
+    if (currentTime > otpExpireTime) {
+      return next(new ErrorHandler('OTP Expire or Invalid!', 401));
+    }
+
+    user.verificationCode = null;
+    user.verificationCodeExpire = null;
+    user.accountVerified = true;
+
+    await user.save();
+
+    genereateJwtTokenForBrowser(user, res, 200, 'Verification successfull!');
+  } catch (error) {
+    console.error(error);
+    s;
+    return next(new ErrorHandler('Internal server Error', 500));
+  }
+});
+
+const login = catchAsyncError(async (req, res, next) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return next(new ErrorHandler('Credentials Missing!', 401));
+  }
+  const user = await User.findOne({ email: email, accountVerified: true });
+  if (!user) {
+    return next(new ErrorHandler('User Not found!', 401));
+  }
+  const isPasswordMatch = await user.compareHashPassword(password);
+  if (!isPasswordMatch) {
+    return next(new ErrorHandler('Invalid Email or Password!', 401));
+  }
+
+  genereateJwtTokenForBrowser(user, res, 200, 'Login Successfull!');
+});
+//log out
+const logOut = catchAsyncError(async (req, res, next) => {
+  res
+    .status(200)
+    .cookie('token', '', {
+      expires: new Date(Date.now()),
+      httpOnly: true,
+      secure: true,
+      sameSite: 'None',
+    })
+    .json({
+      success: true,
+      message: 'Logout successfull!',
+    });
+});
+//get loggedIn user all information
+const getUser = catchAsyncError(async (req, res, next) => {
+  const user = req.user;
+  res.status(200).json({
+    success: true,
+    message: 'Logged IN user info!',
+    user,
+  });
+});
+//forgot password
+const forgotPassword = catchAsyncError(async (req, res, next) => {
+  const { email } = req.body;
+  if (!email) {
+    return next(new ErrorHandler('Enter Your Email!', 401));
+  }
+  const user = await User.findOne({
+    $or: [{ email: email, accountVerified: true }],
+  });
+  if (!user) {
+    return next(new ErrorHandler('User not found!', 404));
+  }
+  //normal token created by crypto
+  const token = user.generatePasswordResetToken();
+
+  if (!token) {
+    return next(new ErrorHandler('token not found'), 401);
+  }
+  //if I don't save the user, the resetToken won't be saved in the database
+  await user.save();
+  const url = `${process.env.FORNTEND_URL}/reset/password/${token}`;
+  const message = `Click this URL below to reset your Password. \n \n ${url} \n \n If you didn't request this, you can safely ignore this email. \n email will expired in 20 minutes`;
+
+  try {
+    sendVerificationEmail(email, 'Password reset email', message);
+    res.status(200).json({
+      success: true,
+      message: `Please check your email!`,
+    });
+  } catch (error) {
+    user.resetVerificationToken = null;
+    user.resetVerificationTokenEXpire = null;
+    await user.save();
+    return next(
+      new ErrorHandler(
+        error.message ? error.message : 'Error from forgot password send!',
+        401
+      )
+    );
+  }
+});
+
+//reset your password
+
+const resetPassword = catchAsyncError(async (req, res, next) => {
+  //normal token created by crypto
+  const { token } = req.params;
+
+  if (!token) {
+    return next(new ErrorHandler('Reset token missing!', 401));
+  }
+  const resetVerificationToken = crypto
+    .createHash('sha256')
+    .update(token)
+    .digest('hex');
+  const user = await User.findOneAndUpdate({
+    resetVerificationToken: resetVerificationToken,
+    resetVerificationTokenEXpire: { $gt: Date.now() },
+  });
+
+  if (!user) {
+    return next(new ErrorHandler('Invalid token!', 401));
+  }
+
+  const { password, confirmPassword } = req.body;
+  if (!password || !confirmPassword) {
+    return next(new ErrorHandler('Credentials missing!', 401));
+  }
+  if (password !== confirmPassword) {
+    return next(
+      new ErrorHandler("password and confirm password dosen't match", 401)
+    );
+  }
+  user.password = password;
+  user.resetVerificationToken = null;
+  user.resetVerificationTokenEXpire = null;
+  await user.save();
+  genereateJwtTokenForBrowser(user, res, 200, 'Password update successfull!');
+});
+
+module.exports = {
+  register,
+  verifyOtp,
+  login,
+  logOut,
+  getUser,
+  forgotPassword,
+  resetPassword,
+};
