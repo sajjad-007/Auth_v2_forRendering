@@ -7,7 +7,8 @@ const genereateJwtTokenForBrowser = (user, res, statuCode, message) => {
       httpOnly: true,
       sameSite: 'none',
       secure: true,
-      partitioned: true,
+      // partitioned: true,
+      // path: '/'/
     })
     .json({
       success: true,
