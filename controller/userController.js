@@ -259,6 +259,8 @@ const logOut = catchAsyncError(async (req, res, next) => {
       httpOnly: true,
       secure: true,
       sameSite: 'None',
+      partitioned: true,
+      path: '/'
     })
     .json({
       success: true,

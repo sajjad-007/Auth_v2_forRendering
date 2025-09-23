@@ -5,10 +5,10 @@ const genereateJwtTokenForBrowser = (user, res, statuCode, message) => {
     .cookie('token', token, {
       expires: new Date(Date.now() + 5 * 24 * 60 * 60 * 1000),
       httpOnly: true,
-      sameSite: 'none',
+      sameSite: 'None',
       secure: true,
-      // partitioned: true,
-      // path: '/'/
+      partitioned: true,
+      path: '/'
     })
     .json({
       success: true,

@@ -11,9 +11,11 @@ configDotenv({ path: './config/config.env' });
 
 app.use(
   cors({
-    origin: 'https://sajjad-auth-v2.netlify.app',
+    origin: ['https://sajjad-auth-v2.netlify.app', 'http://localhost:5173', 'http://localhost:3000'],
     credentials: true,
     methods: ['PUT', 'POST', 'GET', 'DELETE'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    exposedHeaders: ['set-cookie']
   })
 );
 app.use(
